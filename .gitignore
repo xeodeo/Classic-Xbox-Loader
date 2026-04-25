@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.eggs/
+
+# Build / dist
+build/
+dist/
+*.spec.bak
+
+# Logs and runtime data
+*.log
+ia_session.json
+downloads_history.json
+xbox_page_snapshot.md
+
+# Downloads (game ISOs / ZIPs — too large for git)
+downloads/
+
+# Claude / editor internals
+.claude/
+.playwright-mcp/
+.mcp.json
+
+# Misc junk
+sadas
+python
+6.4.0
