@@ -83,9 +83,11 @@ QTableWidget {
     border-radius: 6px;
     selection-background-color: #107c10;
     selection-color: #ffffff;
+    outline: 0px;
 }
-QTableWidget::item { padding: 6px; border: none; }
+QTableWidget::item { padding: 6px; border: none; outline: 0px; }
 QTableWidget::item:hover { background-color: #252525; }
+QTableWidget::item:focus { outline: 0px; border: none; }
 QHeaderView::section {
     background-color: #252525;
     color: #9e9e9e;

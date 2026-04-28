@@ -22,15 +22,42 @@ class ExtractWorker(QThread):
         self.output_dir = output_dir
 
     def run(self):
+        CHUNK = 512 * 1024   # 512 KB read buffer
+        EMIT_EVERY = 5 * 1024 * 1024  # emit progress at most every 5 MB
         try:
             os.makedirs(self.output_dir, exist_ok=True)
             with zipfile.ZipFile(self.zip_path, 'r') as zf:
                 members = zf.infolist()
-                total = len(members)
-                for i, member in enumerate(members, 1):
+                total_bytes = sum(m.file_size for m in members) or 1
+                done_bytes = 0
+                last_emit = 0
+
+                for member in members:
                     self.file_progress.emit(member.filename)
-                    zf.extract(member, self.output_dir)
-                    self.progress.emit(i, total)
+
+                    if member.is_dir():
+                        zf.extract(member, self.output_dir)
+                        continue
+
+                    # ZIP spec uses '/' — build a proper OS path from parts
+                    parts = [p for p in member.filename.split('/') if p and p != '..']
+                    if not parts:
+                        continue
+                    dest = os.path.join(self.output_dir, *parts)
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+
+                    with zf.open(member) as src, open(dest, 'wb') as dst:
+                        while True:
+                            chunk = src.read(CHUNK)
+                            if not chunk:
+                                break
+                            dst.write(chunk)
+                            done_bytes += len(chunk)
+                            if done_bytes - last_emit >= EMIT_EVERY:
+                                last_emit = done_bytes
+                                self.progress.emit(done_bytes, total_bytes)
+
+            self.progress.emit(total_bytes, total_bytes)
             self.finished.emit(self.output_dir)
         except zipfile.BadZipFile:
             self.error.emit(f"Archivo ZIP corrupto: {self.zip_path}")

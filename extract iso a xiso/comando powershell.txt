@@ -1,5 +1,0 @@
-.\extract-xiso.exe -x '.\Manhunt.iso'
-
-                           --------
-
-                          Ahí va el nombre de su juego iso

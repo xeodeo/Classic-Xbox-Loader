@@ -2,9 +2,12 @@
 Fetches game catalog from Internet Archive metadata API.
 Each letter maps to one or more archive.org item identifiers.
 """
+import re
 import logging
 import requests
 from core.auth import get_session
+
+_LANG_TAG_RE = re.compile(r'\s*\([A-Za-z]{2}(?:,[A-Za-z]{2})+\)')
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +85,7 @@ def fetch_letter(letter: str, progress_callback=None) -> list:
                     f"https://archive.org/download/{identifier}/"
                     f"{requests.utils.quote(name)}"
                 )
-                display_name = name[:-4] if name.endswith('.zip') else name
+                display_name = _LANG_TAG_RE.sub('', name[:-4] if name.endswith('.zip') else name).strip()
                 games.append({
                     'name': name,
                     'display_name': display_name,

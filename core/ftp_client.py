@@ -359,6 +359,36 @@ class FTPClient:
                 logger.error(f"FTP download error: {e}")
                 return False, str(e)
 
+    def download_dir(self, remote_path: str, local_path: str,
+                     file_callback=None) -> tuple:
+        """Recursively download a remote directory to a local path.
+        file_callback(filename) is called before each file is downloaded.
+        """
+        with self._lock:
+            try:
+                self._download_dir_recursive(remote_path, local_path, file_callback)
+                return True, local_path
+            except Exception as e:
+                logger.error(f"download_dir error: {e}")
+                return False, str(e)
+
+    def _download_dir_recursive(self, remote_path: str, local_path: str, file_callback):
+        os.makedirs(local_path, exist_ok=True)
+        entries = self.list_dir(remote_path)
+        for e in entries:
+            if e['is_dir']:
+                self._download_dir_recursive(
+                    e['path'],
+                    os.path.join(local_path, e['name']),
+                    file_callback
+                )
+            else:
+                local_file = os.path.join(local_path, e['name'])
+                if file_callback:
+                    file_callback(e['name'])
+                with open(local_file, 'wb') as f:
+                    self.ftp.retrbinary(f"RETR {e['path']}", f.write, blocksize=8192)
+
     def detect_games_folder(self) -> str:
         """Scan common Xbox game folder paths and return the most likely one."""
         e_path = self._partition_paths.get('E:', '/e')

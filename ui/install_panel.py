@@ -20,11 +20,13 @@ from core.ftp_client import get_client, FTPUploadWorker
 
 
 def _sanitize_fatx_name(name: str) -> str:
-    """Remove characters not supported by Xbox FATX filesystem: ( ) ,"""
+    """Sanitize name for Xbox FATX filesystem.
+    FATX limits: 42 chars max, no ( ) , & characters.
+    """
     import re
-    name = re.sub(r'[(),]', '', name)
+    name = re.sub(r'[(),&]', '', name)
     name = re.sub(r' +', ' ', name).strip()
-    return name
+    return name[:42]
 
 
 def _fmt(b: int) -> str:
@@ -90,8 +92,12 @@ class SmartUploadWorker(FTPUploadWorker):
                 self.client.ftp.cwd(parent)
                 try:
                     self.client.ftp.mkd(game_name)
-                except ftplib.error_perm:
-                    pass
+                except ftplib.error_perm as mkd_err:
+                    # 550 = already exists (ok), anything else = real error
+                    if '550' not in str(mkd_err):
+                        raise Exception(
+                            f"No se pudo crear la carpeta '{game_name}': {mkd_err}"
+                        )
                 self.client.ftp.cwd(game_name)
                 self._current_remote = remote
                 self._upload_dir(self.local_dir)
@@ -282,6 +288,13 @@ class InstallPanel(QWidget):
         self.btn_xiso.clicked.connect(self._do_xiso)
         s2.addWidget(self.btn_xiso)
         pl.addLayout(s2)
+
+        self.xiso_bar = QProgressBar()
+        self.xiso_bar.setRange(0, 0)   # indeterminate/animated
+        self.xiso_bar.setVisible(False)
+        self.xiso_bar.setFixedHeight(8)
+        self.xiso_bar.setTextVisible(False)
+        pl.addWidget(self.xiso_bar)
 
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.HLine)
@@ -517,8 +530,15 @@ class InstallPanel(QWidget):
         self.s1_st.setText("⏳")
         self._log(f"Extrayendo: {os.path.basename(self._current_zip)}", "#f7630c")
         self._extract_worker = ExtractWorker(self._current_zip, out_dir)
-        self._extract_worker.progress.connect(
-            lambda d, t: self.extract_bar.setValue(int(d * 100 / t)) if t else None)
+        _last_pct = [0]
+        def _zip_progress(done, total):
+            if not total:
+                return
+            pct = int(done * 100 / total)
+            if pct != _last_pct[0]:
+                _last_pct[0] = pct
+                self.extract_bar.setValue(pct)
+        self._extract_worker.progress.connect(_zip_progress)
         self._extract_worker.file_progress.connect(
             lambda f: self._log(f"  {f}", "#555555"))
         self._extract_worker.finished.connect(self._on_extract_done)
@@ -556,6 +576,7 @@ class InstallPanel(QWidget):
         self._processing_iso = self._current_iso
         self.btn_xiso.setEnabled(False)
         self.s2_st.setText("⏳")
+        self.xiso_bar.setVisible(True)
         self._log("Ejecutando extract-xiso...", "#f7630c")
         self._xiso_worker = XisoWorker(self._current_iso)
         self._xiso_worker.output_line.connect(
@@ -568,6 +589,7 @@ class InstallPanel(QWidget):
         self._processing_iso = None
         self._current_game_dir = game_dir
         self._mark_step(self._current_zip, 'game_dir', game_dir)
+        self.xiso_bar.setVisible(False)
         self.s2_st.setText("✅")
         self._log(f"ISO procesada: {os.path.basename(game_dir)}", "#107c10")
         self.btn_xiso.setEnabled(True)
@@ -580,6 +602,7 @@ class InstallPanel(QWidget):
 
     def _on_xiso_err(self, msg):
         self._processing_iso = None
+        self.xiso_bar.setVisible(False)
         self.s2_st.setText("❌")
         self._log(f"Error: {msg}", "#c42b1c")
         self.btn_xiso.setEnabled(True)

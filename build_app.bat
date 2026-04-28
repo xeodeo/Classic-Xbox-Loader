@@ -19,12 +19,11 @@ pip install -r requirements.txt
 pip install pyinstaller
 echo.
 
-echo [2/4] Compilando con PyInstaller...
+echo [2/3] Compilando con PyInstaller...
 pyinstaller --noconfirm --clean ^
     --name "ClassicXboxLoader" ^
     --windowed ^
     --onedir ^
-    --add-data "extract iso a xiso;extract iso a xiso" ^
     --hidden-import "PyQt6.QtCore" ^
     --hidden-import "PyQt6.QtWidgets" ^
     --hidden-import "PyQt6.QtGui" ^
@@ -40,15 +39,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo [3/4] Copiando extract-xiso...
-if not exist "dist\ClassicXboxLoader\extract iso a xiso" (
-    mkdir "dist\ClassicXboxLoader\extract iso a xiso"
-)
-copy /Y "extract iso a xiso\extract-xiso.exe" "dist\ClassicXboxLoader\extract iso a xiso\"
-copy /Y "extract iso a xiso\LICENSE.TXT" "dist\ClassicXboxLoader\extract iso a xiso\"
-
-echo.
-echo [4/4] Buscando Inno Setup...
+echo [3/3] Buscando Inno Setup...
 set INNO=""
 if exist "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" set INNO="C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 if exist "C:\Program Files\Inno Setup 6\ISCC.exe" set INNO="C:\Program Files\Inno Setup 6\ISCC.exe"

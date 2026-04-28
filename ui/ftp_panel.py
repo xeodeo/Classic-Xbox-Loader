@@ -8,11 +8,11 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView,
     QGroupBox, QComboBox, QAbstractItemView, QMessageBox,
-    QInputDialog, QFileDialog, QProgressDialog, QApplication
+    QInputDialog, QFileDialog, QProgressDialog, QApplication, QDialog, QTextEdit
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont, QColor
-from core.ftp_client import get_client, XBOX_PARTITIONS
+from core.ftp_client import get_client, XBOX_PARTITIONS, FTPUploadWorker
 
 
 def _fmt_size(b: int) -> str:
@@ -79,6 +79,57 @@ class FTPDownloadWorker(QThread):
             self.error.emit(result)
 
 
+class FTPDownloadDirWorker(QThread):
+    file_started = pyqtSignal(str)
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, remote_path, local_path):
+        super().__init__()
+        self.remote_path = remote_path
+        self.local_path = local_path
+
+    def run(self):
+        ok, result = get_client().download_dir(
+            self.remote_path, self.local_path,
+            file_callback=lambda name: self.file_started.emit(name)
+        )
+        if ok:
+            self.finished.emit(result)
+        else:
+            self.error.emit(result)
+
+
+class FTPUploadFilesWorker(QThread):
+    file_started = pyqtSignal(str)
+    progress = pyqtSignal(str, int, int)
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+
+    def __init__(self, local_paths, remote_dir):
+        super().__init__()
+        self.local_paths = local_paths
+        self.remote_dir = remote_dir
+
+    def run(self):
+        try:
+            for lp in self.local_paths:
+                fname = os.path.basename(lp)
+                remote_path = self.remote_dir.rstrip('/') + '/' + fname
+                self.file_started.emit(fname)
+                file_size = os.path.getsize(lp)
+                ok = get_client().upload_file_with_retry(
+                    lp, remote_path,
+                    progress_callback=lambda d, t, _fn=fname: self.progress.emit(_fn, d, t)
+                )
+                if not ok:
+                    self.error.emit(f"Error subiendo '{fname}'")
+                    return
+            self.finished.emit()
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 # ── Main Panel ────────────────────────────────────────────────────────────────
 
 class FTPPanel(QWidget):
@@ -88,6 +139,9 @@ class FTPPanel(QWidget):
         self._list_worker = None
         self._detect_worker = None
         self._dl_worker = None
+        self._dl_dir_worker = None
+        self._ul_worker = None
+        self._ul_files_worker = None
         self._path_stack = []
         self._current_path = '/'
         self._current_entries = []
@@ -173,10 +227,11 @@ class FTPPanel(QWidget):
         nav = QHBoxLayout()
         nav.setSpacing(6)
 
-        self.back_btn = QPushButton("⬅")
-        self.back_btn.setFixedSize(36, 32)
+        self.back_btn = QPushButton("⬅  Atrás")
+        self.back_btn.setMinimumHeight(32)
+        self.back_btn.setMinimumWidth(80)
         self.back_btn.setEnabled(False)
-        self.back_btn.setToolTip("Atrás")
+        self.back_btn.setToolTip("Volver al directorio anterior")
         self.back_btn.clicked.connect(self._go_back)
         nav.addWidget(self.back_btn)
 
@@ -222,10 +277,12 @@ class FTPPanel(QWidget):
             actions.addWidget(b)
             return b
 
-        self.mkdir_btn  = _action_btn("📁  Nueva carpeta", "Crear nueva carpeta en el Xbox", self._mkdir)
-        self.rename_btn = _action_btn("✏️  Renombrar",     "Renombrar archivo o carpeta",    self._rename)
-        self.delete_btn = _action_btn("🗑  Eliminar",      "Eliminar seleccionado",          self._delete, '#c42b1c')
-        self.pc_dl_btn  = _action_btn("⬇  Descargar a PC","Descargar archivo al PC",        self._download_to_pc)
+        self.mkdir_btn       = _action_btn("📁  Nueva carpeta",    "Crear nueva carpeta en el Xbox",              self._mkdir)
+        self.rename_btn      = _action_btn("✏️  Renombrar",        "Renombrar archivo o carpeta",                 self._rename)
+        self.delete_btn      = _action_btn("🗑  Eliminar",         "Eliminar seleccionado",                       self._delete, '#c42b1c')
+        self.pc_dl_btn       = _action_btn("⬇  Descargar a PC",   "Descargar archivo o carpeta al PC",           self._download_to_pc)
+        self.upload_files_btn = _action_btn("⬆  Subir archivos",  "Subir archivos del PC a esta carpeta",        self._upload_files)
+        self.upload_folder_btn= _action_btn("⬆  Subir carpeta",   "Subir carpeta del PC a esta carpeta",         self._upload_folder)
         actions.addStretch()
 
         self.items_lbl = QLabel("")
@@ -309,7 +366,8 @@ class FTPPanel(QWidget):
 
     def _set_connected(self, connected, msg):
         action_btns = [self.mkdir_btn, self.rename_btn, self.delete_btn,
-                       self.pc_dl_btn, self.detect_games_btn]
+                       self.pc_dl_btn, self.detect_games_btn,
+                       self.upload_files_btn, self.upload_folder_btn]
         if connected:
             self.conn_status.setText(f"● {msg}")
             self.conn_status.setStyleSheet("color: #107c10; font-weight: bold;")
@@ -321,6 +379,9 @@ class FTPPanel(QWidget):
             self.file_table.setVisible(True)
             self.no_conn_lbl.setVisible(False)
             self.detect_games_btn.setEnabled(True)
+            self.mkdir_btn.setEnabled(True)
+            self.upload_files_btn.setEnabled(True)
+            self.upload_folder_btn.setEnabled(True)
         else:
             self.conn_status.setText(f"● {msg}")
             self.conn_status.setStyleSheet("color: #c42b1c; font-weight: bold;")
@@ -397,9 +458,12 @@ class FTPPanel(QWidget):
         has_sel = bool(self.file_table.selectedItems())
         self.rename_btn.setEnabled(has_sel)
         self.delete_btn.setEnabled(has_sel)
-        # Only enable PC download for files
         entry = self._selected_entry()
-        self.pc_dl_btn.setEnabled(entry is not None and not entry['is_dir'])
+        self.pc_dl_btn.setEnabled(entry is not None)
+        if entry and entry['is_dir']:
+            self.pc_dl_btn.setText("⬇  Descargar carpeta")
+        else:
+            self.pc_dl_btn.setText("⬇  Descargar a PC")
 
     def _go_back(self):
         if self._path_stack:
@@ -471,42 +535,164 @@ class FTPPanel(QWidget):
 
     def _download_to_pc(self):
         entry = self._selected_entry()
-        if not entry or entry['is_dir']:
-            return
-        local_path, _ = QFileDialog.getSaveFileName(
-            self, "Guardar archivo en PC", entry['name']
-        )
-        if not local_path:
+        if not entry:
             return
 
-        progress = QProgressDialog(
-            f"Descargando '{entry['name']}' del Xbox...", "Cancelar", 0, 100, self
+        if entry['is_dir']:
+            # Download folder — ask for destination directory
+            dest_dir = QFileDialog.getExistingDirectory(
+                self, f"Seleccionar destino para la carpeta '{entry['name']}'"
+            )
+            if not dest_dir:
+                return
+            local_path = os.path.join(dest_dir, entry['name'])
+
+            progress = QProgressDialog(
+                f"Descargando carpeta '{entry['name']}'...", None, 0, 0, self
+            )
+            progress.setWindowTitle("Descargando carpeta del Xbox")
+            progress.setMinimumDuration(0)
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+
+            self._dl_dir_worker = FTPDownloadDirWorker(entry['path'], local_path)
+
+            def on_file(name):
+                progress.setLabelText(f"Descargando: {name}")
+                QApplication.processEvents()
+
+            def on_dir_finished(path):
+                progress.close()
+                self.status_bar.setText(f"✅  Carpeta descargada en: {path}")
+                QMessageBox.information(self, "Descarga completa",
+                    f"Carpeta guardada en:\n{path}")
+
+            def on_dir_error(msg):
+                progress.close()
+                QMessageBox.warning(self, "Error de descarga", msg)
+
+            self._dl_dir_worker.file_started.connect(on_file)
+            self._dl_dir_worker.finished.connect(on_dir_finished)
+            self._dl_dir_worker.error.connect(on_dir_error)
+            self._dl_dir_worker.start()
+        else:
+            # Download single file
+            local_path, _ = QFileDialog.getSaveFileName(
+                self, "Guardar archivo en PC", entry['name']
+            )
+            if not local_path:
+                return
+
+            progress = QProgressDialog(
+                f"Descargando '{entry['name']}' del Xbox...", "Cancelar", 0, 100, self
+            )
+            progress.setWindowTitle("Descargando del Xbox")
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+
+            self._dl_worker = FTPDownloadWorker(entry['path'], local_path)
+
+            def on_progress(done, total):
+                if total:
+                    progress.setValue(int(done * 100 / total))
+                QApplication.processEvents()
+
+            def on_finished(path):
+                progress.close()
+                self.status_bar.setText(f"✅  Descargado a: {path}")
+                QMessageBox.information(self, "Descarga completa",
+                    f"Archivo guardado en:\n{path}")
+
+            def on_error(msg):
+                progress.close()
+                QMessageBox.warning(self, "Error de descarga", msg)
+
+            self._dl_worker.progress.connect(on_progress)
+            self._dl_worker.finished.connect(on_finished)
+            self._dl_worker.error.connect(on_error)
+            self._dl_worker.start()
+
+    def _upload_files(self):
+        """Upload one or more local files to the current remote directory."""
+        if not get_client().connected:
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Seleccionar archivos para subir al Xbox"
         )
-        progress.setWindowTitle("Descargando del Xbox")
+        if not paths:
+            return
+        self._run_upload_files(paths)
+
+    def _upload_folder(self):
+        """Upload a local folder to the current remote directory."""
+        if not get_client().connected:
+            return
+        local_dir = QFileDialog.getExistingDirectory(
+            self, "Seleccionar carpeta para subir al Xbox"
+        )
+        if not local_dir:
+            return
+        folder_name = os.path.basename(local_dir)
+        remote_dest = self._current_path.rstrip('/') + '/' + folder_name
+        self._run_upload_folder(local_dir, remote_dest)
+
+    def _run_upload_files(self, paths):
+        progress = QProgressDialog("Subiendo archivos al Xbox...", "Cancelar", 0, 0, self)
+        progress.setWindowTitle("Subiendo al Xbox")
         progress.setMinimumDuration(0)
-        progress.setValue(0)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
 
-        self._dl_worker = FTPDownloadWorker(entry['path'], local_path)
+        self._ul_files_worker = FTPUploadFilesWorker(paths, self._current_path)
 
-        def on_progress(done, total):
-            if total:
-                progress.setValue(int(done * 100 / total))
+        def on_file(name):
+            progress.setLabelText(f"Subiendo: {name}")
             QApplication.processEvents()
 
-        def on_finished(path):
+        def on_done():
             progress.close()
-            self.status_bar.setText(f"✅  Descargado a: {path}")
-            QMessageBox.information(self, "Descarga completa",
-                f"Archivo guardado en:\n{path}")
+            self.status_bar.setText(f"✅  {len(paths)} archivo(s) subido(s)")
+            self._refresh()
+            QMessageBox.information(self, "Subida completa",
+                f"Se subieron {len(paths)} archivo(s) a:\n{self._current_path}")
 
         def on_error(msg):
             progress.close()
-            QMessageBox.warning(self, "Error de descarga", msg)
+            QMessageBox.warning(self, "Error de subida", msg)
 
-        self._dl_worker.progress.connect(on_progress)
-        self._dl_worker.finished.connect(on_finished)
-        self._dl_worker.error.connect(on_error)
-        self._dl_worker.start()
+        self._ul_files_worker.file_started.connect(on_file)
+        self._ul_files_worker.finished.connect(on_done)
+        self._ul_files_worker.error.connect(on_error)
+        self._ul_files_worker.start()
+
+    def _run_upload_folder(self, local_dir, remote_dest):
+        folder_name = os.path.basename(local_dir)
+        progress = QProgressDialog(
+            f"Subiendo carpeta '{folder_name}' al Xbox...", "Cancelar", 0, 0, self
+        )
+        progress.setWindowTitle("Subiendo al Xbox")
+        progress.setMinimumDuration(0)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+
+        self._ul_worker = FTPUploadWorker(get_client(), local_dir, remote_dest)
+
+        def on_file(name):
+            progress.setLabelText(f"Subiendo: {name}")
+            QApplication.processEvents()
+
+        def on_done():
+            progress.close()
+            self.status_bar.setText(f"✅  Carpeta '{folder_name}' subida")
+            self._refresh()
+            QMessageBox.information(self, "Subida completa",
+                f"Carpeta subida a:\n{remote_dest}")
+
+        def on_error(msg):
+            progress.close()
+            QMessageBox.warning(self, "Error de subida", msg)
+
+        self._ul_worker.file_started.connect(on_file)
+        self._ul_worker.finished.connect(on_done)
+        self._ul_worker.error.connect(on_error)
+        self._ul_worker.start()
 
     # ── Auto-detect games folder ──────────────────────────────────────────────
 
