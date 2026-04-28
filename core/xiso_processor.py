@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 def get_app_dir() -> str:
     if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
+        return sys._MEIPASS
     return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 
