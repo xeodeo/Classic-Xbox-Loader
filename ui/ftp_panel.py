@@ -130,6 +130,12 @@ class FTPUploadFilesWorker(QThread):
             self.error.emit(str(e))
 
 
+class _PingWorker(QThread):
+    result = pyqtSignal(bool)
+    def run(self):
+        self.result.emit(get_client().ping())
+
+
 # ── Main Panel ────────────────────────────────────────────────────────────────
 
 class FTPPanel(QWidget):
@@ -149,9 +155,10 @@ class FTPPanel(QWidget):
         self._setup_ui()
         # Detect external disconnections (e.g. dropped during FTP upload)
         self._conn_check_timer = QTimer(self)
-        self._conn_check_timer.setInterval(2000)
+        self._conn_check_timer.setInterval(10000)
         self._conn_check_timer.timeout.connect(self._check_connection_state)
         self._conn_check_timer.start()
+        self._ping_worker = None
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -330,11 +337,24 @@ class FTPPanel(QWidget):
     # ── Connection ────────────────────────────────────────────────────────────
 
     def _check_connection_state(self):
-        """Detect if the FTP connection was dropped externally (e.g. during upload)."""
-        now = get_client().connected
-        if self._was_connected and not now:
+        """Ping the Xbox to detect dropped connections. Runs every 10 seconds."""
+        client = get_client()
+        if not client.connected:
+            if self._was_connected:
+                self._was_connected = False
+                self._set_connected(False, "Conexión perdida — reconéctate")
+            return
+        # Don't start a new ping if one is already in progress
+        if self._ping_worker and self._ping_worker.isRunning():
+            return
+        self._ping_worker = _PingWorker()
+        self._ping_worker.result.connect(self._on_ping_result)
+        self._ping_worker.start()
+
+    def _on_ping_result(self, alive: bool):
+        if not alive and self._was_connected:
+            self._was_connected = False
             self._set_connected(False, "Conexión perdida — reconéctate")
-        self._was_connected = now
 
     def _toggle_connect(self):
         client = get_client()

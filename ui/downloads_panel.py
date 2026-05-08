@@ -37,6 +37,7 @@ class DownloadsPanel(QWidget):
     def __init__(self, downloads_dir, parent=None):
         super().__init__(parent)
         self.downloads_dir = downloads_dir
+        self._prev_statuses: dict[str, str] = {}   # output_path → last known status
         self._setup_ui()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh)
@@ -99,8 +100,16 @@ class DownloadsPanel(QWidget):
         os.startfile(self.downloads_dir)
 
     def _refresh(self):
+        from core import notifier
         manager = get_manager()
         tasks = manager.queue
+        # Detect newly completed downloads and notify
+        for task in tasks:
+            prev = self._prev_statuses.get(task.output_path)
+            if prev != task.status:
+                if task.status == DownloadTask.COMPLETED and prev == DownloadTask.DOWNLOADING:
+                    notifier.notify("Descarga completada", task.game_name)
+                self._prev_statuses[task.output_path] = task.status
         has = len(tasks) > 0
         self.empty_label.setVisible(not has)
         self.table.setVisible(has)

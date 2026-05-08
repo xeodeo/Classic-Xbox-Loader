@@ -5,7 +5,7 @@ import os
 import sys
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QLineEdit, QGroupBox, QSpinBox, QFrame, QScrollArea, QDialog,
+    QLineEdit, QGroupBox, QSpinBox, QCheckBox, QFrame, QScrollArea, QDialog,
     QDialogButtonBox, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl, QTimer
@@ -222,35 +222,62 @@ class SettingsPanel(QWidget):
         dl_l.addLayout(tr)
         layout.addWidget(dl_group)
 
+        # FTP connections
+        ftp_group = QGroupBox("Transferencia FTP")
+        ftp_l = QVBoxLayout(ftp_group)
+        ftp_row = QHBoxLayout()
+        ftp_row.addWidget(QLabel("Conexiones FTP simultáneas (1-2):"))
+        self.ftp_conn_spin = QSpinBox()
+        self.ftp_conn_spin.setRange(1, 2)
+        _initial_cfg = _cfg.load()
+        self.ftp_conn_spin.setValue(_initial_cfg.get("ftp_connections", 1))
+        self.ftp_conn_spin.setMinimumWidth(80)
+        self.ftp_conn_spin.setMinimumHeight(34)
+        self.ftp_conn_spin.setToolTip("2 conexiones puede acelerar la instalación")
+        self.ftp_conn_spin.valueChanged.connect(self._on_ftp_connections_changed)
+        ftp_row.addWidget(self.ftp_conn_spin)
+        ftp_desc = QLabel("2 conexiones puede acelerar la instalación en servidores compatibles")
+        ftp_desc.setStyleSheet("color: #9e9e9e; font-size: 11px;")
+        ftp_row.addWidget(ftp_desc)
+        ftp_row.addStretch()
+        ftp_l.addLayout(ftp_row)
+        layout.addWidget(ftp_group)
+
+        # Notifications
+        notif_group = QGroupBox("Notificaciones")
+        notif_l = QVBoxLayout(notif_group)
+        self.notif_check = QCheckBox("Mostrar notificaciones del sistema al completar descargas, extracciones e instalaciones")
+        self.notif_check.setChecked(_initial_cfg.get('notifications_enabled', True))
+        self.notif_check.setStyleSheet("color: #cccccc; font-size: 13px;")
+        self.notif_check.toggled.connect(self._on_notif_changed)
+        notif_l.addWidget(self.notif_check)
+        layout.addWidget(notif_group)
+
         # Paths
         paths_group = QGroupBox("Rutas del sistema")
         paths_l = QVBoxLayout(paths_group)
         app_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) \
             else os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
-        for label_text, path in [
-            ("Carpeta de descargas", os.path.join(app_dir, 'downloads')),
-            ("extract-xiso.exe", os.path.join(app_dir, 'extract iso a xiso', 'extract-xiso.exe')),
-        ]:
-            row = QHBoxLayout()
-            lbl = QLabel(f"{label_text}:")
-            lbl.setMinimumWidth(180)
-            lbl.setStyleSheet("color: #9e9e9e;")
-            row.addWidget(lbl)
-            pl = QLabel(path)
-            pl.setStyleSheet("color: #107c10; font-family: Consolas; font-size: 11px;")
-            pl.setWordWrap(True)
-            row.addWidget(pl, 1)
-            el = QLabel("✅" if os.path.exists(path) else "❌")
-            row.addWidget(el)
-            paths_l.addLayout(row)
+        dl_path = os.path.join(app_dir, 'downloads')
+        row = QHBoxLayout()
+        lbl = QLabel("Carpeta de descargas:")
+        lbl.setMinimumWidth(180)
+        lbl.setStyleSheet("color: #9e9e9e;")
+        row.addWidget(lbl)
+        pl = QLabel(dl_path)
+        pl.setStyleSheet("color: #107c10; font-family: Consolas; font-size: 11px;")
+        pl.setWordWrap(True)
+        row.addWidget(pl, 1)
+        row.addWidget(QLabel("✅" if os.path.exists(dl_path) else "❌"))
+        paths_l.addLayout(row)
         layout.addWidget(paths_group)
 
         # About
         about_group = QGroupBox("Acerca de")
         about_l = QVBoxLayout(about_group)
         about_text = QLabel(
-            "<b style='color:#107c10; font-size:15px;'>Classic Xbox Loader v1.0.0</b><br><br>"
+            "<b style='color:#107c10; font-size:15px;'>Classic Xbox Loader v1.0.2</b><br><br>"
             "Descarga, procesa e instala juegos en Xbox Classic automáticamente.<br><br>"
             "<b>Fuente:</b> Internet Archive (Redump.org Xbox Collection)<br>"
             "<b>Procesamiento:</b> extract-xiso.exe<br>"
@@ -338,6 +365,16 @@ class SettingsPanel(QWidget):
         dl_module.NUM_THREADS = v
         data = _cfg.load()
         data['num_threads'] = v
+        _cfg.save(data)
+
+    def _on_ftp_connections_changed(self, v: int):
+        data = _cfg.load()
+        data['ftp_connections'] = v
+        _cfg.save(data)
+
+    def _on_notif_changed(self, enabled: bool):
+        data = _cfg.load()
+        data['notifications_enabled'] = enabled
         _cfg.save(data)
 
     def _refresh_session_ui(self):

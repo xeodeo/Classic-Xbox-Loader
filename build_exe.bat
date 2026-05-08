@@ -9,7 +9,6 @@ pyinstaller --noconfirm --clean ^
     --windowed ^
     --onedir ^
     --icon "app_icon.ico" ^
-    --add-data "extract iso a xiso;extract iso a xiso" ^
     --add-data "app_icon.ico;." ^
     --add-data "microsoft-xbox-1.svg;." ^
     --hidden-import "PyQt6.QtCore" ^

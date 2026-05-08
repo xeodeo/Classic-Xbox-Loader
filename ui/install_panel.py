@@ -6,6 +6,7 @@ Features:
 """
 import os
 import json
+import time
 import ftplib
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
@@ -16,7 +17,8 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 from core.extractor import ExtractWorker, find_iso_in_dir
 from core.xiso_processor import XisoWorker
-from core.ftp_client import get_client, FTPUploadWorker
+from core.ftp_client import get_client, FTPUploadWorker, DualSmartUploadWorker
+from core import config as _config
 
 
 def _sanitize_fatx_name(name: str) -> str:
@@ -35,6 +37,14 @@ def _fmt(b: int) -> str:
     if b < 1024 ** 3:
         return f"{b/1024**2:.1f} MB"
     return f"{b/1024**3:.2f} GB"
+
+
+def _fmt_speed(bps: float) -> str:
+    if bps <= 0:
+        return ""
+    if bps < 1024 ** 2:
+        return f"{bps/1024:.1f} KB/s"
+    return f"{bps/1024**2:.1f} MB/s"
 
 
 def _count_local(path: str) -> tuple[int, int]:
@@ -65,8 +75,8 @@ class SmartUploadWorker(FTPUploadWorker):
       2. Re-navigates to the exact remote directory it was in.
       3. Retries the file upload up to MAX_RETRIES times.
     """
-    file_progress    = pyqtSignal(str, int, int)      # filename, bytes_done, file_total
-    overall_progress = pyqtSignal(int, int, int, int)  # files_done, total_files, bytes_done, total_bytes
+    file_progress    = pyqtSignal(str, 'long long', 'long long')      # filename, bytes_done, file_total
+    overall_progress = pyqtSignal(int, int, 'long long', 'long long')  # files_done, total_files, bytes_done, total_bytes
 
     MAX_RETRIES = 3
 
@@ -202,6 +212,9 @@ class InstallPanel(QWidget):
         self._current_game_dir = None
         self._detected_dest    = ''
         self._processed        = self._load_state()
+        self._speed_t0         = 0.0
+        self._speed_b0         = 0
+        self._speed            = 0.0
         self._setup_ui()
 
     def _setup_ui(self):
@@ -344,7 +357,7 @@ class InstallPanel(QWidget):
         det_row.addWidget(self.btn_install)
         pl.addLayout(det_row)
 
-        # Per-file progress
+        # Per-file progress — worker 1
         pf_row = QHBoxLayout()
         pf_lbl = QLabel("Archivo:")
         pf_lbl.setStyleSheet("color: #9e9e9e; font-size: 11px;")
@@ -361,6 +374,26 @@ class InstallPanel(QWidget):
         pf_row.addWidget(self.file_bar_lbl)
         pl.addLayout(pf_row)
 
+        # Per-file progress — worker 2 (visible only in dual-connection mode)
+        self._file_bar_2_container = QWidget()
+        self._file_bar_2_container.setVisible(False)
+        pf2_row = QHBoxLayout(self._file_bar_2_container)
+        pf2_row.setContentsMargins(0, 0, 0, 0)
+        pf2_lbl = QLabel("Arch 2:")
+        pf2_lbl.setStyleSheet("color: #9e9e9e; font-size: 11px;")
+        pf2_lbl.setMinimumWidth(55)
+        pf2_row.addWidget(pf2_lbl)
+        self.file_bar_2 = QProgressBar()
+        self.file_bar_2.setMaximum(1000)
+        self.file_bar_2.setValue(0)
+        self.file_bar_2.setFixedHeight(10)
+        self.file_bar_2.setTextVisible(False)
+        pf2_row.addWidget(self.file_bar_2, 1)
+        self.file_bar_lbl_2 = QLabel("—")
+        self.file_bar_lbl_2.setStyleSheet("color: #9e9e9e; font-size: 11px; min-width: 130px;")
+        pf2_row.addWidget(self.file_bar_lbl_2)
+        pl.addWidget(self._file_bar_2_container)
+
         # Overall progress
         ov_row = QHBoxLayout()
         ov_lbl = QLabel("Total:")
@@ -374,7 +407,8 @@ class InstallPanel(QWidget):
         self.install_bar.setTextVisible(False)
         ov_row.addWidget(self.install_bar, 1)
         self.install_bar_lbl = QLabel("—")
-        self.install_bar_lbl.setStyleSheet("color: #9e9e9e; font-size: 11px; min-width: 130px;")
+        self.install_bar_lbl.setStyleSheet(
+            "color: #9e9e9e; font-size: 11px; min-width: 220px;")
         ov_row.addWidget(self.install_bar_lbl)
         pl.addLayout(ov_row)
 
@@ -525,20 +559,12 @@ class InstallPanel(QWidget):
         out_dir   = os.path.join(self.downloads_dir, game_name + '_extracted')
         self._extracting_zip = self._current_zip
         self.btn_extract.setEnabled(False)
-        self.extract_bar.setVisible(True)
+        self.extract_bar.setRange(0, 0)   # indeterminate animation
         self.extract_bar.setValue(0)
+        self.extract_bar.setVisible(True)
         self.s1_st.setText("⏳")
         self._log(f"Extrayendo: {os.path.basename(self._current_zip)}", "#f7630c")
         self._extract_worker = ExtractWorker(self._current_zip, out_dir)
-        _last_pct = [0]
-        def _zip_progress(done, total):
-            if not total:
-                return
-            pct = int(done * 100 / total)
-            if pct != _last_pct[0]:
-                _last_pct[0] = pct
-                self.extract_bar.setValue(pct)
-        self._extract_worker.progress.connect(_zip_progress)
         self._extract_worker.file_progress.connect(
             lambda f: self._log(f"  {f}", "#555555"))
         self._extract_worker.finished.connect(self._on_extract_done)
@@ -546,11 +572,14 @@ class InstallPanel(QWidget):
         self._extract_worker.start()
 
     def _on_extract_done(self, out_dir):
+        from core import notifier
         self._extracting_zip = None
+        self.extract_bar.setRange(0, 100)
         self.extract_bar.setValue(100)
         self.extract_bar.setVisible(False)
         self.s1_st.setText("✅")
         self._log("ZIP extraido correctamente.", "#107c10")
+        notifier.notify("Extracción completada", f"ZIP extraído: {os.path.basename(out_dir)}")
         iso = find_iso_in_dir(out_dir)
         if iso:
             self._current_iso = iso
@@ -563,6 +592,7 @@ class InstallPanel(QWidget):
 
     def _on_extract_err(self, msg):
         self._extracting_zip = None
+        self.extract_bar.setRange(0, 100)
         self.extract_bar.setVisible(False)
         self.s1_st.setText("❌")
         self._log(f"Error: {msg}", "#c42b1c")
@@ -586,12 +616,14 @@ class InstallPanel(QWidget):
         self._xiso_worker.start()
 
     def _on_xiso_done(self, game_dir):
+        from core import notifier
         self._processing_iso = None
         self._current_game_dir = game_dir
         self._mark_step(self._current_zip, 'game_dir', game_dir)
         self.xiso_bar.setVisible(False)
         self.s2_st.setText("✅")
         self._log(f"ISO procesada: {os.path.basename(game_dir)}", "#107c10")
+        notifier.notify("ISO procesada", f"Listo para instalar: {os.path.basename(game_dir)}")
         self.btn_xiso.setEnabled(True)
         self.btn_install.setEnabled(True)
         # Count files for info
@@ -689,14 +721,33 @@ class InstallPanel(QWidget):
         self.s3_st.setText("⏳")
         self._log(f"Transfiriendo '{game_name}' → {remote}", "#f7630c")
 
-        self._upload_worker = SmartUploadWorker(
-            client, self._current_game_dir, remote)
+        cfg      = _config.load()
+        use_dual = cfg.get("ftp_connections", 1) == 2
+
+        # Reset speed tracker
+        self._speed_t0 = time.monotonic()
+        self._speed_b0 = 0
+        self._speed    = 0.0
+
+        if use_dual:
+            self._upload_worker = DualSmartUploadWorker(
+                client, self._current_game_dir, remote)
+            self._file_bar_2_container.setVisible(True)
+            self.file_bar_2.setValue(0)
+            self.file_bar_lbl_2.setText("—")
+        else:
+            self._upload_worker = SmartUploadWorker(
+                client, self._current_game_dir, remote)
+            self._file_bar_2_container.setVisible(False)
 
         self._upload_worker.file_started.connect(self._on_file_started)
         self._upload_worker.file_progress.connect(self._on_file_progress)
         self._upload_worker.overall_progress.connect(self._on_overall_progress)
         self._upload_worker.finished.connect(self._on_install_done)
         self._upload_worker.error.connect(self._on_install_err)
+        if use_dual:
+            self._upload_worker.file_started_2.connect(self._on_file_started_2)
+            self._upload_worker.file_progress_2.connect(self._on_file_progress_2)
         self._upload_worker.start()
 
     def _on_file_started(self, fname):
@@ -709,26 +760,52 @@ class InstallPanel(QWidget):
             self.file_bar.setValue(int(done * 1000 / total))
             self.file_bar_lbl.setText(f"{_fmt(done)} / {_fmt(total)}")
 
+    def _on_file_started_2(self, fname):
+        self.file_bar_2.setValue(0)
+        self.file_bar_lbl_2.setText(fname[:28] + '…' if len(fname) > 28 else fname)
+
+    def _on_file_progress_2(self, fname, done, total):
+        if total:
+            self.file_bar_2.setValue(int(done * 1000 / total))
+            self.file_bar_lbl_2.setText(f"{_fmt(done)} / {_fmt(total)}")
+
     def _on_overall_progress(self, files_done, total_files, bytes_done, total_bytes):
-        if total_files:
-            self.install_bar.setValue(int(files_done * 1000 / total_files))
+        bytes_done = max(0, bytes_done)
         if total_bytes:
-            self.install_bar.setValue(int(bytes_done * 1000 / total_bytes))
+            self.install_bar.setValue(
+                int(min(bytes_done, total_bytes) * 1000 // total_bytes))
+        elif total_files:
+            self.install_bar.setValue(int(files_done * 1000 // total_files))
+        # Update transfer speed (refresh every ~0.5 s)
+        now = time.monotonic()
+        dt  = now - self._speed_t0
+        if dt >= 0.5:
+            db             = bytes_done - self._speed_b0
+            self._speed    = db / dt if dt > 0 else 0.0
+            self._speed_t0 = now
+            self._speed_b0 = bytes_done
+        speed_txt = f"  {_fmt_speed(self._speed)}" if self._speed > 0 else ""
         self.install_bar_lbl.setText(
-            f"{files_done}/{total_files} arch  {_fmt(bytes_done)}")
+            f"{files_done}/{total_files} arch  "
+            f"{_fmt(bytes_done)} / {_fmt(total_bytes)}{speed_txt}")
 
     def _on_install_done(self):
+        from core import notifier
         self.file_bar.setValue(1000)
         self.install_bar.setValue(1000)
         self.file_bar_lbl.setText("Completado")
+        self.file_bar_lbl_2.setText("Completado")
         self.install_bar_lbl.setText("Completado")
         self.s3_st.setText("✅")
         self._log("✅ Juego instalado en Xbox correctamente.", "#107c10")
         self.btn_install.setEnabled(True)
+        game = os.path.basename(self._current_game_dir or "")
+        notifier.notify("Instalación completada", f"{game} instalado en Xbox")
 
     def _on_install_err(self, msg):
         self.s3_st.setText("❌")
         self.file_bar_lbl.setText("Error")
+        self.file_bar_lbl_2.setText("—")
         self.install_bar_lbl.setText("Error")
         self.file_bar.setStyleSheet(
             "QProgressBar { background: #2a0a0a; border: none; border-radius: 4px; }"

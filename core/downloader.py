@@ -83,6 +83,20 @@ class DownloadWorker(QThread):
                 self.error.emit(str(e))
             logger.error(f"Download error for {task.game_name}: {e}")
 
+    def _emit_progress(self, task, lock, speed_window, t_now):
+        """Emit progress and current speed using a sliding 4-second window."""
+        speed_window.append((t_now, task.bytes_done))
+        # keep only last 4 seconds
+        cutoff = t_now - 4.0
+        while len(speed_window) > 2 and speed_window[0][0] < cutoff:
+            speed_window.pop(0)
+        if len(speed_window) >= 2:
+            dt = speed_window[-1][0] - speed_window[0][0]
+            db = speed_window[-1][1] - speed_window[0][1]
+            task.speed = db / dt if dt > 0 else 0.0
+        self.progress.emit(task.bytes_done, task.total_bytes)
+        self.speed_update.emit(task.speed)
+
     def _download_multipart(self, task: DownloadTask):
         total = task.total_bytes
         chunk_size = total // NUM_THREADS
@@ -93,49 +107,74 @@ class DownloadWorker(QThread):
         temp_files = [f"{task.output_path}.part{i}" for i in range(NUM_THREADS)]
         lock = threading.Lock()
         errors = []
-        t0 = time.time()
+        speed_window = []
 
         def download_chunk(idx, start, end, temp_path):
-            try:
-                existing = 0
-                mode = 'wb'
-                if os.path.exists(temp_path):
-                    existing = os.path.getsize(temp_path)
-                    if existing >= (end - start + 1):
+            MAX_RETRIES = 5
+            for attempt in range(MAX_RETRIES):
+                if task._cancel_event.is_set():
+                    return
+                try:
+                    # Resume from however far we got (including previous attempts)
+                    existing = 0
+                    mode = 'wb'
+                    if os.path.exists(temp_path):
+                        existing = os.path.getsize(temp_path)
+                        if existing >= (end - start + 1):
+                            if attempt == 0:
+                                with lock:
+                                    task.bytes_done += existing
+                            return
+                        mode = 'ab'
+
+                    cur_start = start + existing
+                    if attempt == 0 and existing > 0:
                         with lock:
                             task.bytes_done += existing
-                        return
-                    start += existing
-                    mode = 'ab'
 
-                resp = task.session.get(
-                    task.url,
-                    headers={'Range': f'bytes={start}-{end}'},
-                    stream=True, timeout=60
-                )
-                ct = resp.headers.get('Content-Type', '')
-                if 'text/html' in ct:
-                    resp.close()
-                    with lock:
-                        errors.append(
-                            "El servidor devolvió HTML en lugar del archivo.\n"
-                            "Inicia sesión en Internet Archive (pestaña Configuración) para descargar."
-                        )
-                    return
-                with open(temp_path, mode) as f:
-                    for data in resp.iter_content(chunk_size=CHUNK_SIZE):
-                        if task._cancel_event.is_set():
-                            return
-                        task._pause_event.wait()
-                        f.write(data)
+                    resp = task.session.get(
+                        task.url,
+                        headers={'Range': f'bytes={cur_start}-{end}'},
+                        stream=True, timeout=90
+                    )
+                    ct = resp.headers.get('Content-Type', '')
+                    if 'text/html' in ct:
+                        resp.close()
                         with lock:
-                            task.bytes_done += len(data)
-                            task.speed = task.bytes_done / max(time.time() - t0, 0.001)
-                        self.progress.emit(task.bytes_done, task.total_bytes)
-                        self.speed_update.emit(task.speed)
-            except Exception as e:
-                with lock:
-                    errors.append(str(e))
+                            errors.append(
+                                "El servidor devolvió HTML en lugar del archivo.\n"
+                                "Inicia sesión en Internet Archive (pestaña Configuración) para descargar."
+                            )
+                        return
+
+                    expected = end - cur_start + 1
+                    received = 0
+                    with open(temp_path, mode) as f:
+                        for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+                            if task._cancel_event.is_set():
+                                return
+                            task._pause_event.wait()
+                            f.write(chunk)
+                            received += len(chunk)
+                            with lock:
+                                task.bytes_done += len(chunk)
+                                self._emit_progress(task, lock, speed_window, time.time())
+
+                    if received >= expected:
+                        return  # chunk complete
+                    # Connection dropped early — retry after brief wait
+                    wait = 2 ** attempt  # 1s, 2s, 4s, 8s, 16s
+                    logger.warning(f"Chunk {idx}: recibidos {received}/{expected} bytes, reintento {attempt+1}/{MAX_RETRIES} en {wait}s")
+                    time.sleep(wait)
+
+                except Exception as e:
+                    wait = 2 ** attempt
+                    logger.warning(f"Chunk {idx} error (intento {attempt+1}/{MAX_RETRIES}): {e} — reintentando en {wait}s")
+                    time.sleep(wait)
+
+            # All retries exhausted
+            with lock:
+                errors.append(f"Chunk {idx}: falló después de {MAX_RETRIES} intentos.")
 
         threads = [
             threading.Thread(target=download_chunk, args=(i, s, e, temp_files[i]), daemon=True)
@@ -147,7 +186,13 @@ class DownloadWorker(QThread):
             t.join()
 
         if errors:
-            raise Exception(f"Chunk errors: {'; '.join(errors)}")
+            # Clean up temp files on error
+            for tp in temp_files:
+                try:
+                    os.remove(tp)
+                except OSError:
+                    pass
+            raise Exception(f"Descarga fallida: {'; '.join(errors)}")
         if task._cancel_event.is_set():
             return
 
@@ -163,6 +208,15 @@ class DownloadWorker(QThread):
                             out.write(buf)
                     os.remove(temp_path)
 
+        # Validate final file size
+        actual = os.path.getsize(task.output_path)
+        if task.total_bytes > 0 and actual < task.total_bytes:
+            os.remove(task.output_path)
+            raise Exception(
+                f"Archivo incompleto: se descargaron {actual:,} bytes de {task.total_bytes:,} esperados. "
+                "Intenta de nuevo — Internet Archive puede haber cortado la conexión."
+            )
+
     def _download_single(self, task: DownloadTask):
         existing = 0
         mode = 'wb'
@@ -174,7 +228,7 @@ class DownloadWorker(QThread):
                 mode = 'ab'
                 task.bytes_done = existing
 
-        resp = task.session.get(task.url, headers=headers, stream=True, timeout=60)
+        resp = task.session.get(task.url, headers=headers, stream=True, timeout=90)
         content_type = resp.headers.get('Content-Type', '')
         if 'text/html' in content_type:
             resp.close()
@@ -185,17 +239,32 @@ class DownloadWorker(QThread):
         if task.total_bytes == 0:
             task.total_bytes = int(resp.headers.get('Content-Length', 0)) + existing
 
-        t0 = time.time()
+        speed_window = []
         with open(task.output_path, mode) as f:
-            for data in resp.iter_content(chunk_size=CHUNK_SIZE):
+            for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
                 if task._cancel_event.is_set():
                     return
                 task._pause_event.wait()
-                f.write(data)
-                task.bytes_done += len(data)
-                task.speed = task.bytes_done / max(time.time() - t0, 0.001)
+                f.write(chunk)
+                task.bytes_done += len(chunk)
+                now = time.time()
+                speed_window.append((now, task.bytes_done))
+                cutoff = now - 4.0
+                while len(speed_window) > 2 and speed_window[0][0] < cutoff:
+                    speed_window.pop(0)
+                if len(speed_window) >= 2:
+                    dt = speed_window[-1][0] - speed_window[0][0]
+                    db = speed_window[-1][1] - speed_window[0][1]
+                    task.speed = db / dt if dt > 0 else 0.0
                 self.progress.emit(task.bytes_done, task.total_bytes)
                 self.speed_update.emit(task.speed)
+
+        # Validate final file size
+        if task.total_bytes > 0 and task.bytes_done < task.total_bytes:
+            raise Exception(
+                f"Archivo incompleto: se descargaron {task.bytes_done:,} bytes de {task.total_bytes:,} esperados. "
+                "Intenta de nuevo — Internet Archive puede haber cortado la conexión."
+            )
 
     def cancel(self):
         self.task._cancel_event.set()

@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('extract iso a xiso', 'extract iso a xiso'), ('app_icon.ico', '.'), ('microsoft-xbox-1.svg', '.')],
+    datas=[('app_icon.ico', '.'), ('microsoft-xbox-1.svg', '.')],
     hiddenimports=['PyQt6.QtCore', 'PyQt6.QtWidgets', 'PyQt6.QtGui', 'PyQt6.QtWebEngineWidgets', 'PyQt6.QtWebEngineCore', 'PyQt6.QtSvg', 'ftplib', 'zipfile'],
     hookspath=[],
     hooksconfig={},

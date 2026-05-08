@@ -13,7 +13,7 @@ import socket
 import ftplib
 import threading
 import logging
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, pyqtSignal, QObject
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +92,18 @@ class FTPClient:
             return False, f"No se pudo conectar a {host}:{port} — {e}"
         except Exception as e:
             return False, str(e)
+
+    def ping(self) -> bool:
+        """Send NOOP to verify the connection is still alive. Sets connected=False on failure."""
+        if not self.connected or not self.ftp:
+            return False
+        try:
+            with self._lock:
+                self.ftp.voidcmd('NOOP')
+            return True
+        except Exception:
+            self.connected = False
+            return False
 
     def reconnect(self) -> bool:
         """Reconnect using the same credentials as the last connect() call."""
@@ -423,7 +435,7 @@ class FTPUploadWorker(QThread):
       - Files uploaded before subdirectories (avoids HDD fragmentation)
       - STOR uses just the filename — never an absolute path
     """
-    progress     = pyqtSignal(str, int, int)   # filename, bytes_done, file_total
+    progress     = pyqtSignal(str, 'long long', 'long long')   # filename, bytes_done, file_total
     file_started = pyqtSignal(str)
     finished     = pyqtSignal()
     error        = pyqtSignal(str)
@@ -499,6 +511,186 @@ class FTPUploadWorker(QThread):
             self.client.ftp.cwd(item)
             self._upload_dir(lp)
             self.client.ftp.cwd('..')
+
+    def cancel(self):
+        self._cancelled = True
+
+
+def _scan_files_recursive(local_dir: str) -> list:
+    """Return sorted list of (local_path, relative_path) for all files under local_dir."""
+    result   = []
+    base     = os.path.normpath(local_dir)
+    base_len = len(base) + 1
+    for root, dirs, files in os.walk(base):
+        dirs.sort()
+        for f in sorted(files):
+            lp  = os.path.join(root, f)
+            rel = lp[base_len:].replace('\\', '/')
+            result.append((lp, rel))
+    return result
+
+
+import queue as _queue
+import time as _time
+
+
+class DualSmartUploadWorker(QThread):
+    """Splits a game directory into two halves and uploads each via an independent
+    FTP connection.  Uses threading.Thread workers + queue polling so that all
+    signals are emitted directly from run() — same pattern as SmartUploadWorker,
+    no sub-worker signal chains that can be silently dropped by PyQt6.
+
+    Worker 0 → file_started / file_progress
+    Worker 1 → file_started_2 / file_progress_2
+    Both    → overall_progress (combined bytes/files, updated every ~150 ms)
+    """
+    file_started     = pyqtSignal(str)
+    file_progress    = pyqtSignal(str, 'long long', 'long long')
+    file_started_2   = pyqtSignal(str)
+    file_progress_2  = pyqtSignal(str, 'long long', 'long long')
+    overall_progress = pyqtSignal(int, int, 'long long', 'long long')
+    finished         = pyqtSignal()
+    error            = pyqtSignal(str)
+
+    def __init__(self, client: FTPClient, local_dir: str,
+                 remote_dir: str, parent=None):
+        super().__init__(parent)
+        self._client     = client
+        self._local_dir  = local_dir
+        self._remote_dir = remote_dir
+        self._cancelled  = False
+
+    def run(self):
+        conn_params = self._client._conn_params
+        if not conn_params:
+            self.error.emit("Sin parámetros de conexión FTP.")
+            return
+
+        all_files   = _scan_files_recursive(self._local_dir)
+        total_files = len(all_files)
+        total_bytes = sum(
+            os.path.getsize(lp) for lp, _ in all_files if os.path.exists(lp))
+
+        if not all_files:
+            self.error.emit("No hay archivos para subir.")
+            return
+
+        # Create remote game directory via the shared (already-connected) client
+        remote = self._remote_dir.replace('\\', '/').rstrip('/')
+        try:
+            with self._client._lock:
+                if not self._client.ftp:
+                    raise Exception("No hay conexión FTP activa.")
+                parent_dir = remote.rsplit('/', 1)[0] or '/'
+                game_name  = remote.rsplit('/', 1)[-1]
+                self._client.ftp.cwd(parent_dir)
+                try:
+                    self._client.ftp.mkd(game_name)
+                except ftplib.error_perm as e:
+                    if '550' not in str(e):
+                        raise Exception(
+                            f"No se pudo crear la carpeta '{game_name}': {e}")
+        except Exception as e:
+            self.error.emit(str(e))
+            return
+
+        mid    = (total_files + 1) // 2
+        halves = [all_files[:mid], all_files[mid:]]
+
+        # Shared state — written by worker threads, read in polling loop
+        done_files  = [0, 0]
+        done_bytes  = [0, 0]
+        errors      = [None, None]
+        events      = _queue.Queue()
+        state_lock  = threading.Lock()
+
+        def upload_half(idx, half):
+            client = FTPClient()
+            ok, msg = client.connect(*conn_params)
+            if not ok:
+                errors[idx] = f"Conexión FTP fallida (worker {idx + 1}): {msg}"
+                return
+            created = set()
+            for lp, rel in half:
+                if self._cancelled:
+                    break
+                parts   = rel.rsplit('/', 1)
+                fname   = parts[-1]
+                rel_dir = parts[0] if len(parts) > 1 else ''
+                rdir    = remote + ('/' + rel_dir if rel_dir else '')
+                if rdir not in created:
+                    client.make_dirs(rdir)
+                    created.add(rdir)
+                fsize = 0
+                try:
+                    fsize = os.path.getsize(lp)
+                except OSError:
+                    pass
+                events.put(('s', idx, fname))
+
+                def _cb(bd, _fs, _fn=fname, _sz=fsize, _i=idx):
+                    events.put(('p', _i, _fn, bd, _sz or 1))
+
+                if not client.upload_file_with_retry(lp, rdir + '/' + fname, _cb):
+                    errors[idx] = f"Error subiendo '{fname}'"
+                    return
+                with state_lock:
+                    done_files[idx] += 1
+                    done_bytes[idx] += fsize
+
+        # Launch parallel upload threads
+        active = []
+        for i, half in enumerate(halves):
+            if not half:
+                continue
+            t = threading.Thread(target=upload_half, args=(i, half), daemon=True)
+            active.append(t)
+            t.start()
+
+        # Poll progress while threads run — signals emitted directly from run()
+        while any(t.is_alive() for t in active):
+            self._drain(events)
+            with state_lock:
+                tf = done_files[0] + done_files[1]
+                tb = done_bytes[0] + done_bytes[1]
+            self.overall_progress.emit(tf, total_files, tb, total_bytes)
+            _time.sleep(0.15)
+
+        for t in active:
+            t.join()
+
+        # Final drain and last progress update
+        self._drain(events)
+        with state_lock:
+            tf = done_files[0] + done_files[1]
+            tb = done_bytes[0] + done_bytes[1]
+        self.overall_progress.emit(tf, total_files, tb, total_bytes)
+
+        err = next((e for e in errors if e), None)
+        if err:
+            self.error.emit(err)
+        else:
+            self.finished.emit()
+
+    def _drain(self, events: _queue.Queue):
+        """Emit all pending file events from the queue."""
+        while True:
+            try:
+                ev = events.get_nowait()
+            except _queue.Empty:
+                break
+            if ev[0] == 's':
+                _, idx, fname = ev
+                if idx == 0:
+                    self.file_started.emit(fname)
+                else:
+                    self.file_started_2.emit(fname)
+            elif ev[0] == 'p':
+                _, idx, fname, bd, total = ev
+                if idx == 0:
+                    self.file_progress.emit(fname, bd, total)
+                else:
+                    self.file_progress_2.emit(fname, bd, total)
 
     def cancel(self):
         self._cancelled = True

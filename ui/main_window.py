@@ -87,7 +87,7 @@ def _show_welcome_if_needed(parent=None):
 
     info_lines = [
         ("Desarrollador", "xeodeo"),
-        ("Versión", "1.0.0"),
+        ("Versión", "1.0.2"),
         ("Fuente", "Internet Archive — Redump Xbox Collection"),
         ("Repositorio", "github.com/xeodeo/Classic-Xbox-Loader"),
     ]
@@ -149,9 +149,12 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Classic Xbox Loader")
-        self.setWindowIcon(_app_icon())
+        icon = _app_icon()
+        self.setWindowIcon(icon)
         self.setMinimumSize(1100, 700)
         self.resize(1300, 820)
+        from core import notifier
+        notifier.init(icon, self)
         from PyQt6.QtCore import QTimer
         QTimer.singleShot(300, lambda: _show_welcome_if_needed(self))
 
@@ -222,7 +225,7 @@ class MainWindow(QMainWindow):
 
         sidebar_layout.addStretch()
 
-        ver_label = QLabel("v1.0.0")
+        ver_label = QLabel("v1.0.2")
         ver_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ver_label.setStyleSheet("color: #444444; padding: 12px; font-size: 11px; background: transparent;")
         sidebar_layout.addWidget(ver_label)
