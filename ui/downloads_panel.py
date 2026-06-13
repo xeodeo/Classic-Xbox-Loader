@@ -221,6 +221,14 @@ class DownloadsPanel(QWidget):
                 al.addWidget(del_file)
 
             elif task.status in (DownloadTask.ERROR, DownloadTask.CANCELLED):
+                if task.status == DownloadTask.ERROR and task.session is not None:
+                    retry_btn = QPushButton("🔄")
+                    retry_btn.setFixedSize(34, 34)
+                    retry_btn.setToolTip("Reintentar descarga (reanuda desde donde se interrumpió)")
+                    retry_btn.setStyleSheet(_btn_base + "QPushButton { background: #107c10; } QPushButton:hover { background: #13a10e; }")
+                    retry_btn.clicked.connect(lambda _, t=task: get_manager().retry(t))
+                    al.addWidget(retry_btn)
+
                 del_list = QPushButton("✕")
                 del_list.setFixedSize(34, 34)
                 del_list.setToolTip("Quitar de la lista")

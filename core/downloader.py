@@ -186,12 +186,7 @@ class DownloadWorker(QThread):
             t.join()
 
         if errors:
-            # Clean up temp files on error
-            for tp in temp_files:
-                try:
-                    os.remove(tp)
-                except OSError:
-                    pass
+            # Keep .part files so the next retry can resume each chunk from where it left off
             raise Exception(f"Descarga fallida: {'; '.join(errors)}")
         if task._cancel_event.is_set():
             return
@@ -377,6 +372,14 @@ class DownloadManager:
         if w:
             w.resume()
         self._notify()
+
+    def retry(self, task: DownloadTask) -> 'DownloadWorker':
+        """Reset a failed task and restart it, resuming from existing .part files."""
+        task._cancel_event.clear()
+        task._pause_event.set()
+        task.bytes_done = 0
+        task.error_msg = ''
+        return self.start(task)
 
     def remove(self, task: DownloadTask):
         """Remove a finished/cancelled task from the queue (does not delete files)."""
